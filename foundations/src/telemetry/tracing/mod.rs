@@ -18,6 +18,9 @@ mod rate_limit;
 #[cfg(feature = "telemetry-otlp-grpc")]
 mod output_otlp_grpc;
 
+#[cfg(feature = "user-tracing")]
+mod output_otlp_uds;
+
 use self::init::TracingHarness;
 use self::internal::{SharedSpan, create_span, current_span, span_trace_id};
 use super::TelemetryContext;

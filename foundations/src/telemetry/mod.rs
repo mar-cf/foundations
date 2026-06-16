@@ -73,7 +73,10 @@ mod scope;
 
 mod telemetry_context;
 
-#[cfg(all(feature = "tracing", feature = "telemetry-otlp-grpc"))]
+#[cfg(all(
+    feature = "tracing",
+    any(feature = "telemetry-otlp-grpc", feature = "user-tracing")
+))]
 mod otlp_conversion;
 
 #[cfg(feature = "testing")]
