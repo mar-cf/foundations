@@ -3,15 +3,11 @@
 //! Sends protobuf-encoded OTLP trace data over HTTP/1.1 to a Unix domain
 //! socket served by a local OTLP receptor.
 //
-// NOTE: nothing calls `start` yet — the `USER_HARNESS` / `init_user` wiring
-// lands in the immediately following PR, which removes this `allow`.
-//
 // The export logic is intentionally split so this client mirrors the shape of a
 // `BatchHandler`: `OtlpUdsClient::process_batch` is the per-batch unit (the
 // future trait method), while the `do_export` drain loop stays generic. This
 // keeps the door open to later relocating the client into oxy as a plugin
 // without reshaping the per-batch logic.
-#![allow(dead_code)]
 
 use super::channel::SharedSpanReceiver;
 use super::init::TraceOutputFutures;

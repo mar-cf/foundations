@@ -350,6 +350,16 @@ pub fn init(config: TelemetryConfig) -> BootstrapResult<TelemetryDriver> {
         }
     }
 
+    #[cfg(feature = "user-tracing")]
+    {
+        if let Some(user_settings) = &config.settings.user_tracing {
+            let initializer = self::tracing::init::init_user(config.service_info, user_settings)?;
+            if let Some(fut) = initializer {
+                tele_futures.push(fut);
+            }
+        }
+    }
+
     TELEMETRY_INITIALIZED.store(true, Ordering::Relaxed);
 
     #[cfg(feature = "telemetry-server")]
