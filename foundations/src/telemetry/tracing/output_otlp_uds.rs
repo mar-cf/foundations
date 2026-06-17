@@ -16,6 +16,7 @@ use crate::telemetry::otlp_conversion::tracing::convert_span;
 use crate::telemetry::settings::OtlpUdsOutputSettings;
 use crate::{BootstrapResult, ServiceInfo};
 use anyhow::ensure;
+use cf_rustracing::span::RoutingMetadata;
 use cf_rustracing_jaeger::span::FinishedSpan;
 use futures_util::future::FutureExt as _;
 use http_body_util::Full;
@@ -26,7 +27,6 @@ use hyper_util::rt::TokioIo;
 use opentelemetry_proto::tonic::collector::trace::v1::ExportTraceServiceRequest;
 use opentelemetry_proto::tonic::trace::v1::ResourceSpans;
 use prost::Message as _;
-use serde::Serialize;
 use std::collections::HashMap;
 use std::sync::Arc;
 use tokio::net::UnixStream;
@@ -76,31 +76,20 @@ impl std::error::Error for OtlpUdsExportError {
     }
 }
 
-/// Per-zone routing metadata used to group spans into requests and to build the
-/// `cf-trace-config` header.
-//
-// TODO: this is a placeholder. Once cf-rustracing adds a typed
-// `routing: Option<RoutingMetadata>` field to `FinishedSpan`, delete this struct
-// and read `span.routing` in `process_batch` instead (see the TODO there).
-#[derive(Clone, Debug, Serialize)]
-struct RoutingMetadata {
-    zone_id: String,
-    account_id: u64,
-    workspace_id: String,
-    destinations: Vec<String>,
-    managed: bool,
-}
-
-impl RoutingMetadata {
-    fn placeholder() -> Self {
-        Self {
-            zone_id: "placeholder-zone".to_string(),
-            account_id: 0,
-            workspace_id: String::new(),
-            destinations: Vec::new(),
-            managed: false,
-        }
-    }
+/// Encodes a span's [`RoutingMetadata`] into the `cf-trace-config` header value.
+///
+/// This is foundations' contract with the receptor, so the wire shape lives here
+/// (not on the `RoutingMetadata` type) and can evolve independently. It's a
+/// simple JSON object of the routing fields.
+fn encode_trace_config(routing: &RoutingMetadata) -> String {
+    serde_json::json!({
+        "zoneId": routing.zone_id,
+        "accountId": routing.account_id,
+        "workspaceId": routing.workspace_id,
+        "destinations": routing.destinations,
+        "managed": routing.managed,
+    })
+    .to_string()
 }
 
 /// Exports user tracing spans as OTLP over a Unix domain socket.
@@ -130,14 +119,16 @@ impl OtlpUdsClient {
     async fn process_batch(&self, service_info: &ServiceInfo, spans: Vec<FinishedSpan>) {
         // Group spans by zone so each request carries a single zone's routing
         // metadata in its `cf-trace-config` header.
-        let mut groups: HashMap<String, (RoutingMetadata, Vec<ResourceSpans>)> = HashMap::new();
+        let mut groups: HashMap<u64, (RoutingMetadata, Vec<ResourceSpans>)> = HashMap::new();
 
         for span in spans {
-            // TODO: replace with `let Some(routing) = span.routing.clone() else { continue };`
-            //       once cf-rustracing adds the typed `routing` field. Until then every span
-            //       is grouped under a single placeholder zone.
-            let routing = RoutingMetadata::placeholder();
-            let zone_id = routing.zone_id.clone();
+            // Spans without routing metadata aren't user-traced spans we can
+            // route, so drop them. Read routing before `convert_span` consumes
+            // the span.
+            let Some(routing) = span.routing().cloned() else {
+                continue;
+            };
+            let zone_id = routing.zone_id;
             let resource_spans = convert_span(span, service_info);
 
             groups
@@ -149,14 +140,7 @@ impl OtlpUdsClient {
 
         for (_zone_id, (routing, resource_spans)) in groups {
             let body = ExportTraceServiceRequest { resource_spans }.encode_to_vec();
-
-            let trace_config = match serde_json::to_string(&routing) {
-                Ok(json) => json,
-                Err(err) => {
-                    reporter_error(err);
-                    continue;
-                }
-            };
+            let trace_config = encode_trace_config(&routing);
 
             if let Err(err) = self.send(body, trace_config).await {
                 reporter_error(err);
@@ -393,9 +377,9 @@ mod tests {
         assert!(err.to_string().contains("non-success status"));
     }
 
-    // Drives the full path: a span produced through a tracer flows through the
-    // channel, is converted + encoded by `process_batch`, and arrives at the
-    // receptor with the placeholder routing in its `cf-trace-config` header.
+    // Drives the full path: a span produced through a tracer (with routing set)
+    // flows through the channel, is converted + encoded by `process_batch`, and
+    // arrives at the receptor with its routing in the `cf-trace-config` header.
     #[tokio::test]
     async fn process_batch_sends_converted_spans() {
         use super::super::channel::unbounded_channel;
@@ -406,11 +390,18 @@ mod tests {
 
         let (sender, span_rx) = unbounded_channel();
 
-        // Produce one finished span, then drop the tracer so the channel closes
-        // and the worker loop terminates after draining.
+        // Produce one finished span with routing, then drop the tracer so the
+        // channel closes and the worker loop terminates after draining.
         {
             let tracer = Tracer::with_consumer(AllSampler, sender);
-            let _span = tracer.span("user-root").start();
+            let mut span = tracer.span("user-root").start();
+            span.set_routing(RoutingMetadata {
+                zone_id: 12345,
+                account_id: 42,
+                workspace_id: "ws-1".to_string(),
+                destinations: vec!["dest-a".to_string()],
+                managed: true,
+            });
         }
 
         let service_info = crate::service_info!();
@@ -426,12 +417,13 @@ mod tests {
             captured.content_type.as_deref(),
             Some(CONTENT_TYPE_PROTOBUF)
         );
-        assert_eq!(
-            captured.trace_config.as_deref(),
-            Some(
-                r#"{"zone_id":"placeholder-zone","account_id":0,"workspace_id":"","destinations":[],"managed":false}"#
-            )
-        );
+        let trace_config: serde_json::Value =
+            serde_json::from_str(captured.trace_config.as_deref().unwrap()).unwrap();
+        assert_eq!(trace_config["zoneId"], 12345);
+        assert_eq!(trace_config["accountId"], 42);
+        assert_eq!(trace_config["workspaceId"], "ws-1");
+        assert_eq!(trace_config["destinations"], serde_json::json!(["dest-a"]));
+        assert_eq!(trace_config["managed"], true);
         // Body is a protobuf-encoded `ExportTraceServiceRequest`.
         assert!(!captured.body.is_empty());
     }
