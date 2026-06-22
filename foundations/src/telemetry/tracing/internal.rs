@@ -3,12 +3,12 @@ use super::init::TracingHarness;
 
 use crate::telemetry::tracing::live::LiveReferenceHandle;
 use cf_rustracing::sampler::BoxSampler;
-use cf_rustracing::tag::Tag;
-use cf_rustracing_jaeger::span::{Span, SpanContext, SpanContextState};
 #[cfg(feature = "user-tracing")]
 use cf_rustracing::span::RoutingMetadata;
+use cf_rustracing::tag::Tag;
 #[cfg(feature = "user-tracing")]
 use cf_rustracing_jaeger::span::TraceId;
+use cf_rustracing_jaeger::span::{Span, SpanContext, SpanContextState};
 use parking_lot::RwLock;
 use rand::RngExt as _;
 use std::borrow::Cow;
@@ -200,8 +200,12 @@ pub(crate) fn start_user_trace(
             high: u64::from_be_bytes(tp.trace_id[..8].try_into().unwrap()),
             low: u64::from_be_bytes(tp.trace_id[8..].try_into().unwrap()),
         };
-        let state =
-            SpanContextState::new(trace_id, u64::from_be_bytes(tp.parent_id), tp.trace_flags, String::new());
+        let state = SpanContextState::new(
+            trace_id,
+            u64::from_be_bytes(tp.parent_id),
+            tp.trace_flags,
+            String::new(),
+        );
         builder = builder.child_of(&SpanContext::new(state, vec![]));
     }
 
