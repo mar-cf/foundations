@@ -21,6 +21,9 @@ mod output_otlp_grpc;
 #[cfg(feature = "user-tracing")]
 mod output_otlp_uds;
 
+#[cfg(feature = "user-tracing")]
+mod traceparent;
+
 use self::init::TracingHarness;
 use self::internal::{SharedSpan, create_span, current_span, span_trace_id};
 use super::TelemetryContext;
@@ -33,6 +36,9 @@ pub use self::testing::{TestSpan, TestTrace, TestTraceIterator, TestTraceOptions
 
 pub use cf_rustracing::tag::TagValue;
 pub use cf_rustracing_jaeger::span::{Span, SpanContextState as SerializableTraceState, TraceId};
+
+#[cfg(feature = "user-tracing")]
+pub use self::traceparent::TraceparentContext;
 
 /// Returns active traces as a JSON dump.
 ///
