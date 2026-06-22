@@ -5,6 +5,10 @@ use crate::telemetry::tracing::live::LiveReferenceHandle;
 use cf_rustracing::sampler::BoxSampler;
 use cf_rustracing::tag::Tag;
 use cf_rustracing_jaeger::span::{Span, SpanContext, SpanContextState};
+#[cfg(feature = "user-tracing")]
+use cf_rustracing::span::RoutingMetadata;
+#[cfg(feature = "user-tracing")]
+use cf_rustracing_jaeger::span::TraceId;
 use parking_lot::RwLock;
 use rand::RngExt as _;
 use std::borrow::Cow;
@@ -135,6 +139,61 @@ pub(crate) fn start_trace(
     link_new_trace_with_current(&mut current_span, &root_span_name, &mut new_trace_root_span);
 
     new_trace_root_span
+}
+
+#[cfg(feature = "user-tracing")]
+pub(crate) fn current_user_span() -> Option<SharedSpan> {
+    TracingHarness::get_user().span_scope_stack.current()
+}
+
+/// Child of the current user span, or inactive when no user trace is active (never a root).
+#[cfg(feature = "user-tracing")]
+pub(crate) fn create_user_span(name: impl Into<Cow<'static, str>>) -> SharedSpan {
+    match current_user_span() {
+        Some(parent) => parent.inner.with_read(|s| s.child(name, |o| o.start())),
+        None => Span::inactive(),
+    }
+    .into()
+}
+
+#[cfg(feature = "user-tracing")]
+pub fn write_current_user_span(write_fn: impl FnOnce(&mut Span)) {
+    let span = match current_user_span() {
+        Some(span) if span.is_sampled => span,
+        _ => return,
+    };
+
+    let mut span_guard = match &span.inner {
+        SharedSpanHandle::Tracked(handle) => handle.write(),
+        SharedSpanHandle::Untracked(rw_lock) => rw_lock.write(),
+        SharedSpanHandle::Inactive => unreachable!("inactive spans can't be sampled"),
+    };
+
+    write_fn(&mut span_guard);
+}
+
+/// Starts a root user span on the user harness, optionally continuing the inbound W3C trace.
+/// `routing` is set at construction and inherited by child spans.
+#[cfg(feature = "user-tracing")]
+pub(crate) fn start_user_trace(
+    name: impl Into<Cow<'static, str>>,
+    inbound: Option<super::TraceparentContext>,
+    routing: RoutingMetadata,
+) -> Span {
+    let tracer = TracingHarness::get_user().tracer();
+    let mut builder = tracer.span(name).routing(routing);
+
+    if let Some(tp) = inbound {
+        let trace_id = TraceId {
+            high: u64::from_be_bytes(tp.trace_id[..8].try_into().unwrap()),
+            low: u64::from_be_bytes(tp.trace_id[8..].try_into().unwrap()),
+        };
+        let state =
+            SpanContextState::new(trace_id, u64::from_be_bytes(tp.parent_id), tp.trace_flags, String::new());
+        builder = builder.child_of(&SpanContext::new(state, vec![]));
+    }
+
+    builder.start()
 }
 
 pub(super) fn reporter_error(err: impl Error) {

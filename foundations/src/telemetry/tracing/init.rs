@@ -62,6 +62,12 @@ impl TracingHarness {
         HARNESS.get().unwrap_or_else(|| &**NOOP_HARNESS)
     }
 
+    /// User-tracing harness, or the no-op harness when the user pipeline isn't initialized.
+    #[cfg(feature = "user-tracing")]
+    pub(crate) fn get_user() -> &'static Self {
+        USER_HARNESS.get().unwrap_or_else(|| &**NOOP_HARNESS)
+    }
+
     #[cfg(feature = "testing")]
     pub(crate) fn tracer(&'static self) -> Cow<'static, Tracer> {
         self.test_tracer_scope_stack

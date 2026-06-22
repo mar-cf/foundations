@@ -394,13 +394,16 @@ mod tests {
         // channel closes and the worker loop terminates after draining.
         {
             let tracer = Tracer::with_consumer(AllSampler, sender);
-            let _span = tracer.span("user-root").routing(RoutingMetadata {
-                zone_id: 12345,
-                account_id: 42,
-                workspace_id: "ws-1".to_string(),
-                destinations: vec!["dest-a".to_string()],
-                managed: true,
-            }).start();
+            let _span = tracer
+                .span("user-root")
+                .routing(RoutingMetadata {
+                    zone_id: 12345,
+                    account_id: 42,
+                    workspace_id: "ws-1".to_string(),
+                    destinations: vec!["dest-a".to_string()],
+                    managed: true,
+                })
+                .start();
         }
 
         let service_info = crate::service_info!();
