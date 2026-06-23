@@ -21,6 +21,11 @@ feature_use!(cfg(feature = "tracing"), {
     });
 });
 
+feature_use!(cfg(feature = "user-tracing"), {
+    use super::tracing::UserSpanScope;
+    use super::tracing::internal::current_user_span;
+});
+
 #[cfg(feature = "testing")]
 use super::testing::TestTelemetryContext;
 
@@ -98,6 +103,9 @@ pub struct TelemetryContext {
     #[cfg(feature = "tracing")]
     pub(super) span: Option<SharedSpan>,
 
+    #[cfg(feature = "user-tracing")]
+    pub(super) user_span: Option<SharedSpan>,
+
     #[cfg(all(feature = "tracing", feature = "testing"))]
     pub(super) test_tracer: Option<Tracer>,
 }
@@ -111,6 +119,9 @@ impl TelemetryContext {
 
             #[cfg(feature = "tracing")]
             span: current_span(),
+
+            #[cfg(feature = "user-tracing")]
+            user_span: current_user_span(),
 
             #[cfg(all(feature = "tracing", feature = "testing"))]
             test_tracer: current_test_tracer(),
@@ -171,6 +182,9 @@ impl TelemetryContext {
 
             #[cfg(feature = "tracing")]
             _span_scope: self.span.as_ref().cloned().map(SpanScope::new),
+
+            #[cfg(feature = "user-tracing")]
+            _user_span_scope: self.user_span.as_ref().cloned().map(UserSpanScope::new),
 
             #[cfg(all(feature = "tracing", feature = "testing"))]
             _test_tracer_scope: self.test_tracer.as_ref().cloned().map(TestTracerScope::new),
@@ -383,6 +397,9 @@ impl TelemetryContext {
 
             span: Some(fork_trace(fork_name)),
 
+            #[cfg(feature = "user-tracing")]
+            user_span: self.user_span.clone(),
+
             #[cfg(feature = "testing")]
             test_tracer: self.test_tracer.clone(),
         }
@@ -457,6 +474,9 @@ impl TelemetryContext {
 
             #[cfg(feature = "tracing")]
             span: self.span.clone(),
+
+            #[cfg(feature = "user-tracing")]
+            user_span: self.user_span.clone(),
 
             #[cfg(all(feature = "tracing", feature = "testing"))]
             test_tracer: self.test_tracer.clone(),

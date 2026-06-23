@@ -40,6 +40,9 @@ pub use cf_rustracing_jaeger::span::{Span, SpanContextState as SerializableTrace
 #[cfg(feature = "user-tracing")]
 pub use self::traceparent::TraceparentContext;
 
+#[cfg(feature = "user-tracing")]
+pub use cf_rustracing::span::RoutingMetadata;
+
 /// Returns active traces as a JSON dump.
 ///
 /// The model for this functionality is <https://pkg.go.dev/golang.org/x/net/trace>
@@ -222,6 +225,36 @@ impl SpanScope {
         let mut ctx = TelemetryContext::current();
 
         ctx.span = Some(self.span);
+
+        ctx
+    }
+}
+
+/// A handle for the scope in which a user-tracing span is active.
+///
+/// Scope ends when the handle is dropped.
+#[cfg(feature = "user-tracing")]
+#[must_use]
+pub struct UserSpanScope {
+    span: SharedSpan,
+    _inner: Scope<SharedSpan>,
+}
+
+#[cfg(feature = "user-tracing")]
+impl UserSpanScope {
+    #[inline]
+    pub(crate) fn new(span: SharedSpan) -> Self {
+        Self {
+            span: span.clone(),
+            _inner: Scope::new(&TracingHarness::get_user().span_scope_stack, span),
+        }
+    }
+
+    /// Converts the user span scope to a [`TelemetryContext`] that can be applied to a future.
+    pub fn into_context(self) -> TelemetryContext {
+        let mut ctx = TelemetryContext::current();
+
+        ctx.user_span = Some(self.span);
 
         ctx
     }
@@ -423,6 +456,50 @@ pub fn start_trace(
     options: StartTraceOptions,
 ) -> SpanScope {
     SpanScope::new(shared_span(internal::start_trace(root_span_name, options)))
+}
+
+/// Starts a root user span (per-request activation), optionally continuing the inbound W3C trace
+/// from `inbound`. `routing` is attached at construction and inherited by child spans.
+///
+/// Without an active root, `user_span` / `with_user_span` / `add_user_span_tags!` are no-ops.
+#[cfg(feature = "user-tracing")]
+pub fn start_user_trace(
+    name: impl Into<Cow<'static, str>>,
+    inbound: Option<TraceparentContext>,
+    routing: RoutingMetadata,
+) -> UserSpanScope {
+    UserSpanScope::new(internal::user_shared_span(internal::start_user_trace(
+        name, inbound, routing,
+    )))
+}
+
+/// Creates a user span as a child of the current user span, or inactive when no user trace is
+/// active. Never starts a root — roots come only from [`start_user_trace`].
+#[cfg(feature = "user-tracing")]
+pub fn user_span(name: impl Into<Cow<'static, str>>) -> UserSpanScope {
+    UserSpanScope::new(internal::create_user_span(name))
+}
+
+/// Introspection and outbound-propagation helpers for the user-tracing pipeline.
+#[cfg(feature = "user-tracing")]
+pub mod user_tracing {
+    use super::internal::current_user_span;
+
+    /// W3C `traceparent` for the current user span, for outbound propagation to the next hop.
+    /// Span-derived (parent-id is the current user span); `None` when no user trace is active.
+    pub fn w3c_traceparent() -> Option<String> {
+        current_user_span()?.inner.with_read(|s| {
+            let state = s.context()?.state();
+
+            Some(format!(
+                "00-{:0>16x}{:0>16x}-{:0>16x}-{:0>2x}",
+                state.trace_id().high,
+                state.trace_id().low,
+                state.span_id(),
+                state.flags()
+            ))
+        })
+    }
 }
 
 /// Returns the current span as a raw [rustracing] crate's `Span` that is used by Foundations internally.
@@ -737,6 +814,68 @@ macro_rules! __set_span_finish_callback {
     }};
 }
 
+/// Adds tags to the current user span. No-op when no user trace is active.
+#[cfg(feature = "user-tracing")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __add_user_span_tags {
+    ( $( $name:expr => $val:expr ),+ ) => {
+        $crate::telemetry::tracing::internal::write_current_user_span(|span| {
+            span.set_tags(|| {
+                vec![ $($crate::reexports_for_macros::cf_rustracing::tag::Tag::new($name, $val)),+ ]
+            });
+        });
+    };
+
+    ( $tags:expr ) => {
+        $crate::telemetry::tracing::internal::write_current_user_span(|span| {
+            span.set_tags(|| {
+                $tags
+                    .into_iter()
+                    .map(|(name, val)| {
+                        $crate::reexports_for_macros::cf_rustracing::tag::Tag::new(name, val)
+                    })
+            });
+        });
+    };
+}
+
+/// Adds log fields to the current user span. No-op when no user trace is active.
+#[cfg(feature = "user-tracing")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __add_user_span_log_fields {
+    ( $( $field:expr => $val:expr ),+ ) => {
+        $crate::telemetry::tracing::internal::write_current_user_span(|span| {
+            span.log(|builder| {
+                $(
+                    builder.field(($field, $val));
+                )+
+            });
+        });
+    };
+}
+
+/// Sets (`$cb`) or clears (`None`) the finish callback on the current user span. No-op when no
+/// user trace is active. Routing is set at construction by `start_user_trace`, so this is a
+/// general escape hatch — not used for routing.
+#[cfg(feature = "user-tracing")]
+#[macro_export]
+#[doc(hidden)]
+macro_rules! __set_user_span_finish_callback {
+    ( None ) => {
+        $crate::telemetry::tracing::internal::write_current_user_span(|span| {
+            span.take_finish_callback();
+        })
+    };
+    ( $cb:expr ) => {{
+        let cb = $cb;
+        $crate::telemetry::tracing::internal::write_current_user_span(move |span| {
+            span.set_finish_callback(cb);
+        })
+    }};
+}
+
 /// A convenience macro to construct [`TestTrace`] for test assertions.
 ///
 /// Note that for span timings the macro always generates default
@@ -924,6 +1063,14 @@ pub use {
     __add_span_log_fields as add_span_log_fields, __add_span_tags as add_span_tags,
     __set_span_finish_callback as set_span_finish_callback,
     __set_span_finish_time as set_span_finish_time, __set_span_start_time as set_span_start_time,
+};
+
+#[cfg(feature = "user-tracing")]
+#[doc(inline)]
+pub use {
+    __add_user_span_log_fields as add_user_span_log_fields,
+    __add_user_span_tags as add_user_span_tags,
+    __set_user_span_finish_callback as set_user_span_finish_callback,
 };
 
 #[cfg(feature = "testing")]
