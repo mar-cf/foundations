@@ -1116,3 +1116,222 @@ pub use {
 #[cfg(feature = "testing")]
 #[doc(inline)]
 pub use __test_trace as test_trace;
+
+#[cfg(all(test, feature = "user-tracing", feature = "testing"))]
+mod user_tracing_tests {
+    use super::{
+        RoutingMetadata, TraceparentContext, add_user_span_log_fields, add_user_span_tags,
+        set_user_span_finish_callback, span, start_user_trace, test_trace, user_span, user_tracing,
+    };
+    use crate::telemetry::TelemetryContext;
+    use crate::telemetry::tracing::{Span, TestTraceOptions};
+    use cf_rustracing::tag::{Tag, TagValue};
+
+    fn routing() -> RoutingMetadata {
+        RoutingMetadata {
+            zone_id: 1,
+            account_id: 2,
+            workspace_id: "ws".to_string(),
+            destinations: vec![],
+            managed: false,
+        }
+    }
+
+    #[test]
+    fn creation_and_nesting() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = start_user_trace("request", None, routing());
+            let _child = user_span("child");
+            let _grandchild = user_span("grandchild");
+        }
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! {
+                "request" => {
+                    "child" => {
+                        "grandchild"
+                    }
+                }
+            }]
+        );
+        // User spans must not leak into the internal pipeline.
+        assert!(ctx.traces(Default::default()).is_empty());
+    }
+
+    #[test]
+    fn tags_and_logs() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = start_user_trace("request", None, routing());
+            add_user_span_tags!("cache.status" => "HIT");
+            add_user_span_log_fields!("event" => "lookup");
+        }
+
+        let opts = TestTraceOptions {
+            include_tags: true,
+            include_logs: true,
+            ..Default::default()
+        };
+        let traces = ctx.user_traces(opts);
+        let root = &traces[0].0;
+
+        assert!(
+            root.tags
+                .contains(&("cache.status".to_string(), TagValue::String("HIT".into())))
+        );
+        assert!(
+            root.logs
+                .contains(&("event".to_string(), "lookup".to_string()))
+        );
+    }
+
+    #[test]
+    fn with_user_span_is_parallel() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = start_user_trace("request", None, routing());
+            let _s = span("op").with_user_span();
+        }
+
+        // Internal pipeline: just the internal span.
+        assert_eq!(ctx.traces(Default::default()), vec![test_trace! { "op" }]);
+        // User pipeline: the parallel user span nested under the user root.
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "op" } }]
+        );
+    }
+
+    #[test]
+    fn continues_inbound_trace() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        let inbound =
+            TraceparentContext::parse(b"00-11223344556677889900aabbccddeeff-a1b2c3d4e5f60718-01")
+                .unwrap();
+        let _root = start_user_trace("request", Some(inbound), routing());
+
+        let out = user_tracing::w3c_traceparent().unwrap();
+        assert!(out.starts_with("00-11223344556677889900aabbccddeeff-"));
+    }
+
+    #[test]
+    fn no_op_without_activation() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            // No `start_user_trace`, so user tracing isn't active for this scope.
+            let _child = user_span("child");
+            add_user_span_tags!("k" => "v");
+        }
+
+        assert!(ctx.user_traces(Default::default()).is_empty());
+    }
+
+    #[test]
+    fn finish_callback_runs() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = start_user_trace("request", None, routing());
+            set_user_span_finish_callback!(|span: &mut Span| {
+                span.set_tag(|| Tag::new("finished", true));
+            });
+        }
+
+        let opts = TestTraceOptions {
+            include_tags: true,
+            ..Default::default()
+        };
+        let traces = ctx.user_traces(opts);
+        assert!(traces[0].0.tags.iter().any(|(k, _)| k == "finished"));
+    }
+
+    #[tokio::test]
+    async fn propagates_across_await() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let root_ctx = start_user_trace("request", None, routing()).into_context();
+            root_ctx
+                .apply(async {
+                    let _child = user_span("child");
+                })
+                .await;
+        }
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "child" } }]
+        );
+    }
+
+    // The user span rides along on the ambient `TelemetryContext` even when propagation goes
+    // through an *internal* span's `into_context()` — no explicit user-span threading needed.
+    #[tokio::test]
+    async fn user_span_carried_by_internal_context() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = start_user_trace("request", None, routing());
+
+            // Propagate via an internal span's context; never touch the user scope.
+            span("internal")
+                .into_context()
+                .apply(async {
+                    let _user_child = user_span("user_child");
+                })
+                .await;
+        }
+
+        // User pipeline: the user child nested under the user root (the user span was carried).
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "user_child" } }]
+        );
+        // Internal pipeline: just the internal span.
+        assert_eq!(
+            ctx.traces(Default::default()),
+            vec![test_trace! { "internal" }]
+        );
+    }
+
+    // Same property via the `#[span_fn]` macro path (a plain internal-traced async fn).
+    #[crate::telemetry::tracing::span_fn("internal_fn", crate_path = "crate")]
+    async fn internal_fn() {
+        let _user_child = user_span("user_child");
+    }
+
+    #[tokio::test]
+    async fn user_span_carried_by_span_fn() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            let _root = start_user_trace("request", None, routing());
+            internal_fn().await;
+        }
+
+        assert_eq!(
+            ctx.user_traces(Default::default()),
+            vec![test_trace! { "request" => { "user_child" } }]
+        );
+        assert_eq!(
+            ctx.traces(Default::default()),
+            vec![test_trace! { "internal_fn" }]
+        );
+    }
+}

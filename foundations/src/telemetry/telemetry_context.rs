@@ -24,6 +24,10 @@ feature_use!(cfg(feature = "tracing"), {
 feature_use!(cfg(feature = "user-tracing"), {
     use super::tracing::UserSpanScope;
     use super::tracing::internal::current_user_span;
+
+    feature_use!(cfg(feature = "testing"), {
+        use super::tracing::testing::{UserTestTracerScope, current_user_test_tracer};
+    });
 });
 
 #[cfg(feature = "testing")]
@@ -108,6 +112,9 @@ pub struct TelemetryContext {
 
     #[cfg(all(feature = "tracing", feature = "testing"))]
     pub(super) test_tracer: Option<Tracer>,
+
+    #[cfg(all(feature = "user-tracing", feature = "testing"))]
+    pub(super) user_test_tracer: Option<Tracer>,
 }
 
 impl TelemetryContext {
@@ -125,6 +132,9 @@ impl TelemetryContext {
 
             #[cfg(all(feature = "tracing", feature = "testing"))]
             test_tracer: current_test_tracer(),
+
+            #[cfg(all(feature = "user-tracing", feature = "testing"))]
+            user_test_tracer: current_user_test_tracer(),
         }
     }
 
@@ -188,6 +198,13 @@ impl TelemetryContext {
 
             #[cfg(all(feature = "tracing", feature = "testing"))]
             _test_tracer_scope: self.test_tracer.as_ref().cloned().map(TestTracerScope::new),
+
+            #[cfg(all(feature = "user-tracing", feature = "testing"))]
+            _user_test_tracer_scope: self
+                .user_test_tracer
+                .as_ref()
+                .cloned()
+                .map(UserTestTracerScope::new),
         }
     }
 
@@ -402,6 +419,9 @@ impl TelemetryContext {
 
             #[cfg(feature = "testing")]
             test_tracer: self.test_tracer.clone(),
+
+            #[cfg(all(feature = "user-tracing", feature = "testing"))]
+            user_test_tracer: self.user_test_tracer.clone(),
         }
     }
 }
@@ -480,6 +500,9 @@ impl TelemetryContext {
 
             #[cfg(all(feature = "tracing", feature = "testing"))]
             test_tracer: self.test_tracer.clone(),
+
+            #[cfg(all(feature = "user-tracing", feature = "testing"))]
+            user_test_tracer: self.user_test_tracer.clone(),
         }
     }
 }
