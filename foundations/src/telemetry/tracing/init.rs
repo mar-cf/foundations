@@ -46,6 +46,24 @@ static NOOP_HARNESS: CachePadded<LazyLock<TracingHarness>> =
         }
     }));
 
+// Separate no-op fallback for the user pipeline so user spans never share the internal harness's
+// scope stacks when `USER_HARNESS` isn't initialized (mirrors `NOOP_HARNESS`).
+#[cfg(feature = "user-tracing")]
+static USER_NOOP_HARNESS: CachePadded<LazyLock<TracingHarness>> =
+    CachePadded::new(LazyLock::new(|| {
+        let (noop_tracer, _) = Tracer::new(NullSampler.boxed());
+
+        TracingHarness {
+            tracer: noop_tracer,
+            span_scope_stack: Default::default(),
+
+            #[cfg(feature = "testing")]
+            test_tracer_scope_stack: Default::default(),
+
+            active_roots: Default::default(),
+        }
+    }));
+
 pub(crate) struct TracingHarness {
     tracer: Tracer,
 
@@ -62,10 +80,10 @@ impl TracingHarness {
         HARNESS.get().unwrap_or_else(|| &**NOOP_HARNESS)
     }
 
-    /// User-tracing harness, or the no-op harness when the user pipeline isn't initialized.
+    /// User-tracing harness, or the user no-op harness when the user pipeline isn't initialized.
     #[cfg(feature = "user-tracing")]
     pub(crate) fn get_user() -> &'static Self {
-        USER_HARNESS.get().unwrap_or_else(|| &**NOOP_HARNESS)
+        USER_HARNESS.get().unwrap_or_else(|| &**USER_NOOP_HARNESS)
     }
 
     #[cfg(feature = "testing")]
