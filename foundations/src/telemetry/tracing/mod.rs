@@ -26,6 +26,10 @@ mod traceparent;
 
 use self::init::TracingHarness;
 use self::internal::{SharedSpan, create_span, current_span, shared_span, span_trace_id};
+#[cfg(feature = "user-tracing")]
+use self::internal::{create_user_span, current_user_span, user_shared_span};
+#[cfg(feature = "user-tracing")]
+use cf_rustracing::span::InspectableSpan;
 use super::TelemetryContext;
 use super::scope::Scope;
 use std::borrow::Cow;
@@ -168,6 +172,11 @@ pub use foundations_macros::span_fn;
 pub struct SpanScope {
     span: SharedSpan,
     _inner: Scope<SharedSpan>,
+
+    #[cfg(feature = "user-tracing")]
+    user_span: Option<SharedSpan>,
+    #[cfg(feature = "user-tracing")]
+    _user_inner: Option<Scope<SharedSpan>>,
 }
 
 impl SpanScope {
@@ -176,7 +185,30 @@ impl SpanScope {
         Self {
             span: span.clone(),
             _inner: Scope::new(&TracingHarness::get().span_scope_stack, span),
+
+            #[cfg(feature = "user-tracing")]
+            user_span: None,
+            #[cfg(feature = "user-tracing")]
+            _user_inner: None,
         }
+    }
+
+    /// Opens a parallel user span (child of the current user span, named after this span) when a
+    /// user trace is active; otherwise a no-op. The user span shares this scope's lifetime.
+    #[cfg(feature = "user-tracing")]
+    pub fn with_user_span(mut self) -> Self {
+        if current_user_span().is_some() {
+            let name = self.span.inner.with_read(|s| s.operation_name().to_string());
+            let user_span = create_user_span(name);
+
+            self._user_inner = Some(Scope::new(
+                &TracingHarness::get_user().span_scope_stack,
+                user_span.clone(),
+            ));
+            self.user_span = Some(user_span);
+        }
+
+        self
     }
 
     /// Converts the span scope to [`TelemetryContext`] that can be a applied to a future.
@@ -225,6 +257,11 @@ impl SpanScope {
         let mut ctx = TelemetryContext::current();
 
         ctx.span = Some(self.span);
+
+        #[cfg(feature = "user-tracing")]
+        if let Some(user_span) = self.user_span {
+            ctx.user_span = Some(user_span);
+        }
 
         ctx
     }
@@ -468,7 +505,7 @@ pub fn start_user_trace(
     inbound: Option<TraceparentContext>,
     routing: RoutingMetadata,
 ) -> UserSpanScope {
-    UserSpanScope::new(internal::user_shared_span(internal::start_user_trace(
+    UserSpanScope::new(user_shared_span(internal::start_user_trace(
         name, inbound, routing,
     )))
 }
@@ -477,7 +514,7 @@ pub fn start_user_trace(
 /// active. Never starts a root — roots come only from [`start_user_trace`].
 #[cfg(feature = "user-tracing")]
 pub fn user_span(name: impl Into<Cow<'static, str>>) -> UserSpanScope {
-    UserSpanScope::new(internal::create_user_span(name))
+    UserSpanScope::new(create_user_span(name))
 }
 
 /// Introspection and outbound-propagation helpers for the user-tracing pipeline.
