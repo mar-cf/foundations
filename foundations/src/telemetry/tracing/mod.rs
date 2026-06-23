@@ -1334,4 +1334,38 @@ mod user_tracing_tests {
             vec![test_trace! { "internal_fn" }]
         );
     }
+
+    // `with_user_span()` is a no-op when no user trace is active: the internal span is still
+    // created, but no parallel user span is produced.
+    #[test]
+    fn with_user_span_no_op_when_inactive() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        {
+            // No `start_user_trace` => user tracing not active for this scope.
+            let _s = span("op").with_user_span();
+        }
+
+        assert_eq!(ctx.traces(Default::default()), vec![test_trace! { "op" }]);
+        assert!(ctx.user_traces(Default::default()).is_empty());
+    }
+
+    #[crate::telemetry::tracing::span_fn("user_fn", user = true, crate_path = "crate")]
+    async fn user_fn() {}
+
+    // `#[span_fn(user = true)]` is likewise a no-op for the user pipeline when inactive.
+    #[tokio::test]
+    async fn span_fn_user_no_op_when_inactive() {
+        let ctx = TelemetryContext::test();
+        let _scope = ctx.scope();
+
+        user_fn().await;
+
+        assert_eq!(
+            ctx.traces(Default::default()),
+            vec![test_trace! { "user_fn" }]
+        );
+        assert!(ctx.user_traces(Default::default()).is_empty());
+    }
 }
