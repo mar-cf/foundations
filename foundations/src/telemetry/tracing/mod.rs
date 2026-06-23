@@ -28,10 +28,10 @@ use self::init::TracingHarness;
 use self::internal::{SharedSpan, create_span, current_span, shared_span, span_trace_id};
 #[cfg(feature = "user-tracing")]
 use self::internal::{create_user_span, current_user_span, user_shared_span};
-#[cfg(feature = "user-tracing")]
-use cf_rustracing::span::InspectableSpan;
 use super::TelemetryContext;
 use super::scope::Scope;
+#[cfg(feature = "user-tracing")]
+use cf_rustracing::span::InspectableSpan;
 use std::borrow::Cow;
 use std::sync::Arc;
 
@@ -198,7 +198,10 @@ impl SpanScope {
     #[cfg(feature = "user-tracing")]
     pub fn with_user_span(mut self) -> Self {
         if current_user_span().is_some() {
-            let name = self.span.inner.with_read(|s| s.operation_name().to_string());
+            let name = self
+                .span
+                .inner
+                .with_read(|s| s.operation_name().to_string());
             let user_span = create_user_span(name);
 
             self._user_inner = Some(Scope::new(
