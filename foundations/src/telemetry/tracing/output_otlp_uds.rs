@@ -429,4 +429,89 @@ mod tests {
         // Body is a protobuf-encoded `ExportTraceServiceRequest`.
         assert!(!captured.body.is_empty());
     }
+
+    // Full producer path: `init_user` stands up `USER_HARNESS` + the OTLP/UDS exporter, then
+    // `start_user_trace` + `user_span` + `add_user_span_tags!` produce spans that reach the
+    // receptor with routing in the `cf-trace-config` header. (nextest isolates this in its own
+    // process, so the one-shot `USER_HARNESS` is fine.)
+    #[tokio::test]
+    async fn user_pipeline_exports_with_routing() {
+        use crate::telemetry::settings::{UserTracesOutput, UserTracingSettings};
+        use crate::telemetry::tracing::{add_user_span_tags, start_user_trace, user_span};
+        use opentelemetry_proto::tonic::common::v1::any_value::Value;
+        use prost::Message as _;
+
+        let (socket_path, _dir, mut rx) = spawn_receptor(StatusCode::OK);
+
+        let settings = UserTracingSettings {
+            enabled: true,
+            max_queue_size: None,
+            output: UserTracesOutput::OtlpUds(settings_for(&socket_path)),
+        };
+
+        let service_info = crate::service_info!();
+        crate::telemetry::tracing::init::init_user(&service_info, &settings).unwrap();
+
+        {
+            let _root = start_user_trace(
+                "request",
+                None,
+                RoutingMetadata {
+                    zone_id: 12345,
+                    account_id: 42,
+                    workspace_id: "ws-1".to_string(),
+                    destinations: vec!["dest-a".to_string()],
+                    managed: true,
+                },
+            );
+
+            let _child = user_span("child");
+            add_user_span_tags!("cache.status" => "HIT");
+        }
+
+        let captured = rx.recv().await.unwrap();
+        assert_eq!(captured.path, TRACES_PATH);
+
+        let trace_config: serde_json::Value =
+            serde_json::from_str(captured.trace_config.as_deref().unwrap()).unwrap();
+        assert_eq!(trace_config["zoneId"], 12345);
+        assert_eq!(trace_config["accountId"], 42);
+        assert_eq!(trace_config["workspaceId"], "ws-1");
+        assert_eq!(trace_config["destinations"], serde_json::json!(["dest-a"]));
+        assert_eq!(trace_config["managed"], true);
+
+        // Decode the OTLP body and verify the producer API actually emitted the expected spans.
+        let req = ExportTraceServiceRequest::decode(captured.body.as_slice()).unwrap();
+        let spans: Vec<_> = req
+            .resource_spans
+            .iter()
+            .flat_map(|rs| &rs.scope_spans)
+            .flat_map(|ss| &ss.spans)
+            .collect();
+
+        let root = spans
+            .iter()
+            .find(|s| s.name == "request")
+            .expect("root span exported");
+        let child = spans
+            .iter()
+            .find(|s| s.name == "child")
+            .expect("child span exported");
+
+        // `add_user_span_tags!` wrote to the current user span (the child), not the root.
+        let tag = child
+            .attributes
+            .iter()
+            .find(|kv| kv.key == "cache.status")
+            .expect("cache.status tag present on child");
+        assert!(matches!(
+            &tag.value.as_ref().unwrap().value,
+            Some(Value::StringValue(v)) if v == "HIT"
+        ));
+        assert!(!root.attributes.iter().any(|kv| kv.key == "cache.status"));
+
+        // Correct hierarchy: child is a child of root within the same trace.
+        assert_eq!(child.trace_id, root.trace_id);
+        assert_eq!(child.parent_span_id, root.span_id);
+    }
 }
