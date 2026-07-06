@@ -189,7 +189,7 @@ pub fn write_current_user_span(write_fn: impl FnOnce(&mut Span)) {
 #[cfg(feature = "user-tracing")]
 pub(crate) fn start_user_trace(
     name: impl Into<Cow<'static, str>>,
-    routing: RoutingMetadata,
+    routing: Arc<dyn RoutingMetadata>,
     inbound: Option<super::TraceparentContext>,
 ) -> Span {
     let tracer = TracingHarness::get_user().tracer();

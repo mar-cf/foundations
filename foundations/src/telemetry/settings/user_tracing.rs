@@ -71,6 +71,9 @@ pub struct OtlpUdsOutputSettings {
     /// Path to the Unix domain socket for the OTLP endpoint.
     pub socket_path: String,
 
+    /// Name of the header carrying each span's encoded routing.
+    pub routing_header_name: String,
+
     /// Number of concurrent worker tasks for user trace export.
     ///
     /// # Default
@@ -93,6 +96,7 @@ impl Default for OtlpUdsOutputSettings {
     fn default() -> Self {
         Self {
             socket_path: String::new(),
+            routing_header_name: String::new(),
             num_tasks: OtlpUdsOutputSettings::default_num_tasks(),
             max_batch_size: OtlpUdsOutputSettings::default_max_batch_size(),
         }

@@ -10,7 +10,6 @@ use crate::telemetry::otlp_conversion::tracing::convert_span;
 use crate::telemetry::settings::OtlpUdsOutputSettings;
 use crate::{BootstrapResult, ServiceInfo};
 use anyhow::ensure;
-use cf_rustracing::span::RoutingMetadata;
 use cf_rustracing_jaeger::span::FinishedSpan;
 use futures_util::future::FutureExt as _;
 use http_body_util::Full;
@@ -27,7 +26,6 @@ use tokio::net::UnixStream;
 
 const TRACES_PATH: &str = "/v1/traces";
 const CONTENT_TYPE_PROTOBUF: &str = "application/x-protobuf";
-const TRACE_CONFIG_HEADER: &str = "cf-trace-config";
 const HOST_HEADER_VALUE: &str = "localhost";
 
 /// A failure exporting a single OTLP request over the Unix domain socket.
@@ -70,26 +68,11 @@ impl std::error::Error for OtlpUdsExportError {
     }
 }
 
-/// Encodes a span's [`RoutingMetadata`] into the `cf-trace-config` header value.
-///
-/// This is foundations' contract with the receptor, so the wire shape lives here
-/// (not on the `RoutingMetadata` type) and can evolve independently. It's a
-/// simple JSON object of the routing fields.
-fn encode_trace_config(routing: &RoutingMetadata) -> String {
-    serde_json::json!({
-        "zoneId": routing.zone_id,
-        "accountId": routing.account_id,
-        "accountTag": routing.account_tag,
-        "destinations": routing.destinations,
-        "persist": routing.persist,
-    })
-    .to_string()
-}
-
 /// Exports user tracing spans as OTLP over a Unix domain socket.
 #[derive(Debug)]
 pub(super) struct OtlpUdsClient {
     socket_path: String,
+    routing_header: String,
 }
 
 impl OtlpUdsClient {
@@ -98,50 +81,50 @@ impl OtlpUdsClient {
             !settings.socket_path.is_empty(),
             "user tracing OTLP UDS `socket_path` must be set"
         );
+        ensure!(
+            !settings.routing_header_name.is_empty(),
+            "user tracing OTLP UDS `routing_header_name` must be set"
+        );
 
         Ok(Self {
             socket_path: settings.socket_path.clone(),
+            routing_header: settings.routing_header_name.clone(),
         })
     }
 
-    /// Processes a single drained batch of spans: groups them by zone, converts
-    /// each to OTLP, and POSTs one request per zone. Errors are reported and do
-    /// not abort the batch.
+    /// Processes a single drained batch of spans: groups them by routing,
+    /// converts each to OTLP, and POSTs one request per group. Errors are
+    /// reported and do not abort the batch.
     async fn process_batch(&self, service_info: &ServiceInfo, spans: Vec<FinishedSpan>) {
-        // Group spans by zone so each request carries a single zone's routing
-        // metadata in its `cf-trace-config` header.
-        let mut groups: HashMap<u64, (RoutingMetadata, Vec<ResourceSpans>)> = HashMap::new();
+        // Group spans by routing so each request carries a single routing value
+        // in its header, encoded once per group.
+        let mut groups: HashMap<String, (String, Vec<ResourceSpans>)> = HashMap::new();
 
         for span in spans {
-            // Spans without routing metadata aren't user-traced spans we can
-            // route, so drop them. Read routing before `convert_span` consumes
-            // the span.
-            let Some(routing) = span.routing().cloned() else {
+            // Spans without routing aren't user-traced spans we can route, so
+            // drop them. Borrow routing before `convert_span` consumes the span.
+            let Some(routing) = span.routing() else {
                 continue;
             };
-            let zone_id = routing.zone_id;
-            let resource_spans = convert_span(span, service_info);
+            let entry = groups
+                .entry(routing.group_key())
+                .or_insert_with(|| (routing.encode(), Vec::new()));
 
-            groups
-                .entry(zone_id)
-                .or_insert_with(|| (routing, Vec::new()))
-                .1
-                .push(resource_spans);
+            entry.1.push(convert_span(span, service_info));
         }
 
-        for (_zone_id, (routing, resource_spans)) in groups {
+        for (_group_key, (header_value, resource_spans)) in groups {
             let body = ExportTraceServiceRequest { resource_spans }.encode_to_vec();
-            let trace_config = encode_trace_config(&routing);
 
-            if let Err(err) = self.send(body, trace_config).await {
+            if let Err(err) = self.send(body, header_value).await {
                 reporter_error(err);
             }
         }
     }
 
-    /// POSTs a single OTLP request body to the receptor, tagged with the
-    /// per-zone `cf-trace-config` header.
-    async fn send(&self, body: Vec<u8>, trace_config: String) -> Result<(), OtlpUdsExportError> {
+    /// POSTs a single OTLP request body to the receptor, tagged with the routing
+    /// header.
+    async fn send(&self, body: Vec<u8>, header_value: String) -> Result<(), OtlpUdsExportError> {
         let stream = UnixStream::connect(&self.socket_path)
             .await
             .map_err(OtlpUdsExportError::Connect)?;
@@ -162,7 +145,7 @@ impl OtlpUdsClient {
             .uri(TRACES_PATH)
             .header(HOST, HOST_HEADER_VALUE)
             .header(CONTENT_TYPE, CONTENT_TYPE_PROTOBUF)
-            .header(TRACE_CONFIG_HEADER, trace_config)
+            .header(self.routing_header.as_str(), header_value)
             .body(Full::new(Bytes::from(body)))
             .map_err(OtlpUdsExportError::BuildRequest)?;
 
@@ -223,6 +206,7 @@ async fn do_export(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use cf_rustracing::span::RoutingMetadata;
     use http_body_util::BodyExt as _;
     use hyper::Response;
     use hyper::body::Incoming;
@@ -232,6 +216,28 @@ mod tests {
     use tempfile::TempDir;
     use tokio::net::UnixListener;
     use tokio::sync::mpsc;
+
+    const TEST_ROUTING_HEADER: &str = "cf-trace-config";
+
+    #[derive(Debug)]
+    struct TestRouting {
+        zone_id: u64,
+        account_id: u64,
+    }
+
+    impl RoutingMetadata for TestRouting {
+        fn group_key(&self) -> String {
+            format!("{}|{}", self.zone_id, self.account_id)
+        }
+
+        fn encode(&self) -> String {
+            serde_json::json!({
+                "zoneId": self.zone_id,
+                "accountId": self.account_id,
+            })
+            .to_string()
+        }
+    }
 
     struct CapturedRequest {
         method: String,
@@ -275,7 +281,7 @@ mod tests {
                         path: parts.uri.path().to_string(),
                         host: get("host"),
                         content_type: get("content-type"),
-                        trace_config: get(TRACE_CONFIG_HEADER),
+                        trace_config: get(TEST_ROUTING_HEADER),
                         body: body.collect().await.unwrap().to_bytes().to_vec(),
                     };
 
@@ -302,6 +308,7 @@ mod tests {
     fn settings_for(socket_path: &Path) -> OtlpUdsOutputSettings {
         OtlpUdsOutputSettings {
             socket_path: socket_path.to_string_lossy().into_owned(),
+            routing_header_name: TEST_ROUTING_HEADER.to_string(),
             num_tasks: 1,
             max_batch_size: 8,
         }
@@ -311,6 +318,7 @@ mod tests {
     async fn new_rejects_empty_socket_path() {
         let err = OtlpUdsClient::new(&OtlpUdsOutputSettings {
             socket_path: String::new(),
+            routing_header_name: TEST_ROUTING_HEADER.to_string(),
             num_tasks: 1,
             max_batch_size: 8,
         })
@@ -385,13 +393,10 @@ mod tests {
             let tracer = Tracer::with_consumer(AllSampler, sender);
             let _span = tracer
                 .span("user-root")
-                .routing(RoutingMetadata {
+                .routing(Arc::new(TestRouting {
                     zone_id: 12345,
                     account_id: 42,
-                    account_tag: "0123456789abcdef0123456789abcdef".to_string(),
-                    destinations: vec!["dest-a".to_string()],
-                    persist: true,
-                })
+                }))
                 .start();
         }
 
@@ -412,19 +417,13 @@ mod tests {
             serde_json::from_str(captured.trace_config.as_deref().unwrap()).unwrap();
         assert_eq!(trace_config["zoneId"], 12345);
         assert_eq!(trace_config["accountId"], 42);
-        assert_eq!(
-            trace_config["accountTag"],
-            "0123456789abcdef0123456789abcdef"
-        );
-        assert_eq!(trace_config["destinations"], serde_json::json!(["dest-a"]));
-        assert_eq!(trace_config["persist"], true);
         // Body is a protobuf-encoded `ExportTraceServiceRequest`.
         assert!(!captured.body.is_empty());
     }
 
     // Full producer path: `init_user` stands up `USER_HARNESS` + the OTLP/UDS exporter, then
     // `start_user_trace` + `user_span` + `add_user_span_tags!` produce spans that reach the
-    // receptor with routing in the `cf-trace-config` header. (nextest isolates this in its own
+    // receptor with routing in the configured routing header. (nextest isolates this in its own
     // process, so the one-shot `USER_HARNESS` is fine.)
     #[tokio::test]
     async fn user_pipeline_exports_with_routing() {
@@ -447,12 +446,9 @@ mod tests {
         {
             let _root = start_user_trace(
                 "request",
-                RoutingMetadata {
+                TestRouting {
                     zone_id: 12345,
                     account_id: 42,
-                    account_tag: "0123456789abcdef0123456789abcdef".to_string(),
-                    destinations: vec!["dest-a".to_string()],
-                    persist: true,
                 },
                 None,
             );
@@ -468,12 +464,6 @@ mod tests {
             serde_json::from_str(captured.trace_config.as_deref().unwrap()).unwrap();
         assert_eq!(trace_config["zoneId"], 12345);
         assert_eq!(trace_config["accountId"], 42);
-        assert_eq!(
-            trace_config["accountTag"],
-            "0123456789abcdef0123456789abcdef"
-        );
-        assert_eq!(trace_config["destinations"], serde_json::json!(["dest-a"]));
-        assert_eq!(trace_config["persist"], true);
 
         // Decode the OTLP body and verify the producer API actually emitted the expected spans.
         let req = ExportTraceServiceRequest::decode(captured.body.as_slice()).unwrap();
@@ -534,12 +524,9 @@ mod tests {
         {
             let _root = start_user_trace(
                 "request",
-                RoutingMetadata {
+                TestRouting {
                     zone_id: 12345,
                     account_id: 42,
-                    account_tag: "0123456789abcdef0123456789abcdef".to_string(),
-                    destinations: vec!["dest-a".to_string()],
-                    persist: true,
                 },
                 Some(inbound),
             );
@@ -579,12 +566,9 @@ mod tests {
         {
             let _root = start_user_trace(
                 "request",
-                RoutingMetadata {
+                TestRouting {
                     zone_id: 12345,
                     account_id: 42,
-                    account_tag: "0123456789abcdef0123456789abcdef".to_string(),
-                    destinations: vec!["dest-a".to_string()],
-                    persist: true,
                 },
                 None,
             );

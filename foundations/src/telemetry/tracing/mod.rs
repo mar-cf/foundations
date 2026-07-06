@@ -505,11 +505,13 @@ pub fn start_trace(
 #[cfg(feature = "user-tracing")]
 pub fn start_user_trace(
     name: impl Into<Cow<'static, str>>,
-    routing: RoutingMetadata,
+    routing: impl RoutingMetadata + 'static,
     inbound: Option<TraceparentContext>,
 ) -> UserSpanScope {
     UserSpanScope::new(user_shared_span(internal::start_user_trace(
-        name, routing, inbound,
+        name,
+        std::sync::Arc::new(routing),
+        inbound,
     )))
 }
 
@@ -1127,13 +1129,26 @@ mod user_tracing_tests {
     use crate::telemetry::tracing::{Span, TestTraceOptions};
     use cf_rustracing::tag::{Tag, TagValue};
 
-    fn routing() -> RoutingMetadata {
-        RoutingMetadata {
+    #[derive(Debug)]
+    struct TestRouting {
+        zone_id: u64,
+        account_id: u64,
+    }
+
+    impl RoutingMetadata for TestRouting {
+        fn group_key(&self) -> String {
+            format!("{}|{}", self.zone_id, self.account_id)
+        }
+
+        fn encode(&self) -> String {
+            format!("zone={};account={}", self.zone_id, self.account_id)
+        }
+    }
+
+    fn routing() -> TestRouting {
+        TestRouting {
             zone_id: 1,
             account_id: 2,
-            account_tag: "0123456789abcdef0123456789abcdef".to_string(),
-            destinations: vec![],
-            persist: false,
         }
     }
 
